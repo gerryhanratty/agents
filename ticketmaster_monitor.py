@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 import asyncio
 import os
-import sys
 from datetime import datetime
 
-# Add Playwright to path
-sys.path.insert(0, "/Users/gerry/Library/Python/3.9/lib/python/site-packages")
 from playwright.async_api import async_playwright
 import resend
 
@@ -20,9 +17,9 @@ EVENTS = [
     },
 ]
 
-TO_EMAIL = "ghanratty@gmail.com"
+TO_EMAIL = os.environ.get("TICKETMASTER_ALERT_EMAIL", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-LOG_FILE = os.path.expanduser("~/ticketmaster_monitor.log")
+LOG_FILE = os.environ.get("TICKETMASTER_LOG_FILE", os.path.expanduser("~/ticketmaster_monitor.log"))
 
 
 def log(msg):
@@ -87,6 +84,10 @@ async def check_tickets(url):
 def send_email(event, result):
     if not RESEND_API_KEY:
         log("ERROR: RESEND_API_KEY env var not set — cannot send email.")
+        return
+
+    if not TO_EMAIL:
+        log("ERROR: TICKETMASTER_ALERT_EMAIL env var not set — cannot send email.")
         return
 
     resend.api_key = RESEND_API_KEY
