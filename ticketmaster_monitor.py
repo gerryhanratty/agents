@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+Ticketmaster Event Monitor
+
+This script monitors Ticketmaster event pages for ticket availability.
+It MUST run locally with a visible browser window - Ticketmaster blocks
+headless/automated access. The browser window will open and remain visible
+during checks.
+
+Tickets are checked for:
+- Regular ticket availability
+- Resale tickets
+- Common keywords indicating purchase options
+
+Email alerts are sent via Resend when tickets are found.
+"""
 import asyncio
 import os
 from datetime import datetime
@@ -30,8 +45,16 @@ def log(msg):
 
 
 async def check_tickets(url):
+    """
+    Check a Ticketmaster event page for ticket availability.
+    
+    IMPORTANT: Runs with headless=False (visible browser) because Ticketmaster
+    blocks headless/automated access. Browser window will be visible.
+    
+    Returns dict with ticket status information.
+    """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=False)  # Must be visible!
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
