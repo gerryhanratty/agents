@@ -1,0 +1,14 @@
+# API keys / secrets — never commit these
+.env
+.env.*
+config.local.*
+secrets.*
+*.key
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
