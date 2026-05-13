@@ -83,7 +83,13 @@ with sync_playwright() as p:
 
 ### 1. Write an observations report
 
-Save a markdown report to `~/code/product-work/user_test/YYYY-MM-DD-HH-MM-<slug>.md` where `<slug>` is a kebab-case version of the task (e.g. `log-in`, `create-new-yety`).
+Save a markdown report to `$USER_TEST_NOTES_DIR/YYYY-MM-DD-HH-MM-<slug>.md` where `<slug>` is a kebab-case version of the task (e.g. `log-in`, `create-new-yety`).
+
+First resolve the path:
+```bash
+echo $USER_TEST_NOTES_DIR
+```
+If the variable is unset, stop and tell the user to add `export USER_TEST_NOTES_DIR=<path-to-your-notes-folder>` to their `~/.zshrc`.
 
 Report format:
 
@@ -118,7 +124,7 @@ result: pass | fail | partial
 - ...
 ```
 
-The `~/code/product-work/user_test/` directory already exists in the private YetyApp/product-work repo.
+Ensure the directory exists: `mkdir -p $USER_TEST_NOTES_DIR`
 
 ### 2. Confirm to the user
 
