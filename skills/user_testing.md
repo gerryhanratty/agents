@@ -81,8 +81,45 @@ with sync_playwright() as p:
 
 ## After running
 
-Report:
-- What actions were taken step by step
-- The final URL/state of the page
-- Any errors encountered and what they mean
-- Suggested next test tasks if relevant
+### 1. Write an observations report
+
+Save a markdown report to `~/agents/notes/user_testing/YYYY-MM-DD-HH-MM-<slug>.md` where `<slug>` is a kebab-case version of the task (e.g. `log-in`, `create-new-yety`).
+
+Report format:
+
+```markdown
+---
+date: YYYY-MM-DD HH:MM
+task: "<task description as given>"
+url: https://yety.ie
+result: pass | fail | partial
+---
+
+## Task
+<restate the task in one sentence>
+
+## Steps taken
+1. Navigated to https://yety.ie
+2. ...
+
+## Observations
+- <anything notable about the UI, flow, errors, or unexpected behaviour>
+- <include selector issues, missing elements, confusing copy, etc.>
+
+## Outcome
+<one paragraph summary — did the task succeed? what was the final state?>
+
+## Issues found
+| # | Severity | Description |
+|---|----------|-------------|
+| 1 | High / Medium / Low | ... |
+
+## Suggested follow-up tests
+- ...
+```
+
+Create the `~/agents/notes/user_testing/` directory if it doesn't exist.
+
+### 2. Confirm to the user
+
+Tell the user the full path to the report file and give a one-line summary of the outcome.
