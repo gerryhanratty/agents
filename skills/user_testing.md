@@ -83,7 +83,7 @@ with sync_playwright() as p:
 
 ### 1. Write an observations report
 
-Save a markdown report to `~/agents/notes/user_testing/YYYY-MM-DD-HH-MM-<slug>.md` where `<slug>` is a kebab-case version of the task (e.g. `log-in`, `create-new-yety`).
+Save a markdown report to `~/code/product-work/user_test/YYYY-MM-DD-HH-MM-<slug>.md` where `<slug>` is a kebab-case version of the task (e.g. `log-in`, `create-new-yety`).
 
 Report format:
 
@@ -118,7 +118,7 @@ result: pass | fail | partial
 - ...
 ```
 
-Create the `~/agents/notes/user_testing/` directory if it doesn't exist.
+The `~/code/product-work/user_test/` directory already exists in the private YetyApp/product-work repo.
 
 ### 2. Confirm to the user
 
