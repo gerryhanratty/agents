@@ -2,18 +2,28 @@
 
 A local event monitoring tool that watches Ticketmaster event pages for ticket availability and sends email alerts when tickets are found.
 
-## ⚠️ Important: Local Execution Required
+## Execution notes
 
-**This script MUST run locally on your machine with a visible browser window.** Ticketmaster blocks headless and automated access, so the browser window will open and remain visible during ticket checks.
+The monitor runs **headless by default** and works fine that way — verified
+against a live ticketmaster.ie event page, which renders the real ticket list
+under headless Chromium. (An earlier version of this README claimed a visible
+browser was mandatory; that is not the case.)
 
-This is NOT suitable for running on remote servers or in cloud environments.
+Ticketmaster returns an HTTP 401 on the event page while still serving the full
+rendered page, so status codes are not used as a health signal.
+
+If you ever do hit a bot challenge, force a visible browser with:
+
+```bash
+TICKETMASTER_HEADLESS=0 python ticketmaster_monitor.py
+```
 
 ## Requirements
 
 - Python 3.7+
 - Playwright browser automation library
 - Resend account (free) for email alerts
-- A visible desktop (not SSH/headless environment)
+- `python-dotenv` (optional — only needed if you use a `.env` file)
 
 ## Setup
 
@@ -75,33 +85,54 @@ Run the monitor periodically by adding to your crontab:
 crontab -e
 ```
 
-Add this line to check every 30 minutes:
+Add a single line to check every hour:
 
 ```cron
-*/30 * * * * cd /path/to/agents && python ticketmaster_monitor.py >> /var/log/ticketmaster.log 2>&1
+0 * * * * . $HOME/.ticketmaster.env && /usr/bin/python3 /path/to/agents/2026/ticketmaster_monitor.py >> $HOME/ticketmaster_monitor.log 2>&1
 ```
 
-Or check every hour:
+Notes:
 
-```cron
-0 * * * * cd /path/to/agents && python ticketmaster_monitor.py >> /var/log/ticketmaster.log 2>&1
-```
-
-Make sure the cron job runs in a session where a display is available (this typically works on local macOS/Linux machines).
+- Use `.` rather than `source` — cron runs `/bin/sh`, where `source` is not portable.
+- Keep it to **one line ending in a newline**. A crontab whose lines get joined
+  produces a command ending `2>&10 * * * * ...`, where `2>&10` redirects stderr
+  to file descriptor 10; that fd is not open, so the shell aborts before running
+  anything and the job silently never executes.
+- Use absolute paths; cron has a minimal environment.
 
 ## How It Works
 
-1. Opens a browser to each event URL
-2. Waits for page to load (network idle)
-3. Scrapes the page for:
-   - Price indicators (€, $, £)
-   - Ticket-related text elements
-   - Keywords like "resale", "buy tickets", "add to cart"
-4. Determines ticket availability status:
-   - **Sold out**: No price indicators found
-   - **Available**: Price indicators or purchase keywords found
-   - **Resale**: Resale-specific keywords found
-5. Sends email alert if tickets are found
+1. Opens a headless browser to each event URL
+2. Waits for the page to render (falls back to `domcontentloaded` if
+   `networkidle` times out on ad/analytics traffic)
+3. Reads the **rendered ticket list** (`#list-view` / `#quickpicks`), not raw HTML
+4. Classifies the event into one status:
+   - **available** — priced listings are showing in the ticket list
+   - **none** — the list renders "no results"
+   - **dead** — the event page 404s/410s (event removed or past)
+   - **cancelled** — JSON-LD `eventStatus` says cancelled
+   - **unclear** — the list could not be read (never alerts)
+5. Sends an email **only when an event transitions into `available`**
+
+### Why not raw-HTML keyword matching
+
+Every Ticketmaster page embeds a complete UI translations dictionary in
+`<script id="__NEXT_DATA__">`, which contains the literal strings "Sold Out",
+"resale", "buy tickets", "Limited Availability" and so on. Searching the raw
+HTML for those keywords therefore matches on **every** page — including on a
+410 "page not found" page. The previous version of this script did exactly that
+and emailed a false "tickets available!" alert every hour.
+
+Detection now reads only text that is actually rendered to the user, and
+filters out delivery copy such as "Gift Wrap + Post out IE and UK €5.99" so a
+postage price is never mistaken for ticket inventory.
+
+## State / alert de-duplication
+
+The last known status per event is stored in `~/.ticketmaster_state.json`
+(override with `TICKETMASTER_STATE_FILE`). Alerts are edge-triggered: going
+`none → available` emails once; staying `available` on later runs does not
+re-email. Delete the state file to reset.
 
 ## Logs
 
@@ -123,10 +154,20 @@ tail -f ~/ticketmaster_monitor.log
 - Check your `TICKETMASTER_ALERT_EMAIL` is set
 - Look at logs for error messages
 
-**Ticketmaster returns "Access Denied"**
-- You're likely running in headless mode - this script requires a visible browser
-- Ensure the browser window stays open during execution
-- If running via cron, ensure cron has access to a display
+**Status is always `unclear`**
+- Ticketmaster may have changed its ticket-list markup; check the `#list-view`
+  and `#quickpicks` selectors still exist on the page
+- Or you hit a bot challenge — try `TICKETMASTER_HEADLESS=0`
+
+**Status is `dead`**
+- The event has been removed from Ticketmaster (past or cancelled). Delete it
+  from the `EVENTS` list.
+
+**Cron job never runs**
+- Check `crontab -l | wc -l` matches the number of jobs you expect; joined
+  lines silently break the whole crontab
+- On macOS, `cron` may need Full Disk Access under System Settings →
+  Privacy & Security
 
 **Connection timeouts**
 - Ticketmaster pages can take a while to load

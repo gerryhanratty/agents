@@ -2,154 +2,261 @@
 """
 Ticketmaster Event Monitor
 
-This script monitors Ticketmaster event pages for ticket availability.
-It MUST run locally with a visible browser window - Ticketmaster blocks
-headless/automated access. The browser window will open and remain visible
-during checks.
+Monitors Ticketmaster event pages for ticket / resale availability and emails
+an alert via Resend when availability appears.
 
-Tickets are checked for:
-- Regular ticket availability
-- Resale tickets
-- Common keywords indicating purchase options
+Detection reads the *rendered ticket list*, not raw HTML. Ticketmaster ships a
+full translations dictionary inside `<script id="__NEXT_DATA__">` on every page,
+so raw-HTML keyword matching ("sold out", "resale", "buy tickets") matches on
+every page regardless of real availability — including on dead event pages.
 
-Email alerts are sent via Resend when tickets are found.
+Alerts are edge-triggered: an email is sent when an event's state *changes*
+into an available state, not on every run that finds tickets.
 """
 import asyncio
+import json
 import os
-from datetime import datetime
+import re
+import sys
+from datetime import datetime, timezone
 
 from playwright.async_api import async_playwright
 import resend
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
 
 EVENTS = [
     {
         "name": "Angine de Poitrine (16 Oct 2026)",
         "url": "https://www.ticketmaster.ie/angine-de-poitrine-16-10-2026/event/18006481B129DEEC",
     },
-    {
-        "name": "Big Thief Dublin (29 Apr 2026)",
-        "url": "https://www.ticketmaster.ie/big-thief-dublin-29-04-2026/event/1800631581826F5D",
-    },
 ]
 
 TO_EMAIL = os.environ.get("TICKETMASTER_ALERT_EMAIL", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-LOG_FILE = os.environ.get("TICKETMASTER_LOG_FILE", os.path.expanduser("~/ticketmaster_monitor.log"))
+FROM_EMAIL = os.environ.get("TICKETMASTER_FROM_EMAIL", "Ticket Monitor <onboarding@resend.dev>")
+LOG_FILE = os.path.expanduser(
+    os.environ.get("TICKETMASTER_LOG_FILE", "~/ticketmaster_monitor.log")
+)
+STATE_FILE = os.path.expanduser(
+    os.environ.get("TICKETMASTER_STATE_FILE", "~/.ticketmaster_state.json")
+)
+
+# Headless works: verified rendering the real event page and ticket list.
+HEADLESS = os.environ.get("TICKETMASTER_HEADLESS", "1") != "0"
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Visible-text markers that Ticketmaster renders when the list is empty.
+EMPTY_LIST_MARKERS = [
+    "couldn't find any results",
+    "couldn`t find any results",
+    "could not find any results",
+    "no results",
+]
+
+PRICE_RE = re.compile(r"[€$£]\s?\d")
+DEAD_PAGE_MARKERS = ["page not found", "server error", "410:", "404:"]
 
 
 def log(msg):
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    print(line)
-    with open(LOG_FILE, "a") as f:
-        f.write(line + "\n")
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"(could not write log: {e})", flush=True)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except OSError as e:
+        log(f"WARN: could not write state file: {e}")
 
 
 async def check_tickets(url):
-    """
-    Check a Ticketmaster event page for ticket availability.
-    
-    IMPORTANT: Runs with headless=False (visible browser) because Ticketmaster
-    blocks headless/automated access. Browser window will be visible.
-    
-    Returns dict with ticket status information.
-    """
+    """Return a dict describing the event's current availability state."""
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)  # Must be visible!
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        browser = await p.chromium.launch(headless=HEADLESS)
+        context = await browser.new_context(user_agent=USER_AGENT, locale="en-IE")
         page = await context.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=45000)
-        await page.wait_for_timeout(6000)
-
-        content = await page.content()
-
-        # Try to grab any price/ticket info text
-        ticket_info = []
-        for selector in ["[data-testid*='ticket']", ".ticket", "[class*='ticket']", "[class*='price']"]:
+        result = {"status": "unknown", "prices": [], "detail": ""}
+        try:
             try:
-                elements = await page.query_selector_all(selector)
-                for el in elements[:5]:
-                    text = (await el.inner_text()).strip()
-                    if text and len(text) < 200:
-                        ticket_info.append(text)
+                await page.goto(url, wait_until="networkidle", timeout=45000)
+            except Exception:
+                # networkidle can time out on ad/analytics chatter; the DOM is
+                # usually complete well before that.
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(6000)
+
+            title = (await page.title()) or ""
+
+            # --- dead / removed event page -------------------------------
+            if any(m in title.lower() for m in DEAD_PAGE_MARKERS):
+                result["status"] = "dead"
+                result["detail"] = f"Event page returns: {title.strip()}"
+                return result
+
+            # --- structured event metadata (JSON-LD) ---------------------
+            event_status, start_date = None, None
+            try:
+                blocks = await page.eval_on_selector_all(
+                    "script[type='application/ld+json']", "els => els.map(e => e.textContent)"
+                )
+                for raw in blocks:
+                    try:
+                        data = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(data, dict) and "Event" in str(data.get("@type", "")):
+                        event_status = data.get("eventStatus", "") or ""
+                        start_date = data.get("startDate")
+                        break
             except Exception:
                 pass
+            result["event_status"] = event_status
+            result["start_date"] = start_date
 
-        ticket_info = list(set(ticket_info))[:10]
+            if event_status and "cancelled" in event_status.lower():
+                result["status"] = "cancelled"
+                result["detail"] = "Event is marked cancelled."
+                return result
 
-        # Resale tickets with prices are available even if sold-out text is present
-        has_priced_tickets = any("€" in t or "$" in t or "£" in t for t in ticket_info)
-        has_resale = any("resale" in t.lower() for t in ticket_info) or "resale" in content.lower()
+            # --- rendered ticket list ------------------------------------
+            list_text = ""
+            for selector in ["#list-view", "#quickpicks", "#main-content", "body"]:
+                try:
+                    el = await page.query_selector(selector)
+                    if el:
+                        list_text = await el.inner_text()
+                        if list_text.strip():
+                            break
+                except Exception:
+                    continue
 
-        sold_out_keywords = ["sold out", "soldout", "no tickets available", "not available"]
-        is_sold_out = any(kw.lower() in content.lower() for kw in sold_out_keywords)
+            low = list_text.lower()
+            prices = PRICE_RE.findall(list_text)
+            price_lines = [
+                ln.strip()
+                for ln in list_text.splitlines()
+                if PRICE_RE.search(ln) and len(ln.strip()) < 160
+            ]
+            # Delivery/fee copy ("Gift Wrap + Post out IE and UK €5.99") is not
+            # ticket inventory.
+            price_lines = [
+                ln for ln in price_lines
+                if not any(w in ln.lower() for w in ("post out", "gift wrap", "etickets", "delivery"))
+            ]
+            is_empty = any(m in low for m in EMPTY_LIST_MARKERS)
 
-        # Only truly sold out if no priced tickets found
-        truly_sold_out = is_sold_out and not has_priced_tickets
-
-        resale_keywords = [
-            "resale", "fan-to-fan", "buy tickets", "tickets from",
-            "add to cart", "select tickets", "ticket prices"
-        ]
-        found_keywords = [kw for kw in resale_keywords if kw.lower() in content.lower()]
-
-        await browser.close()
-        return {
-            "sold_out": truly_sold_out,
-            "has_resale": has_resale,
-            "found_keywords": found_keywords,
-            "ticket_info": ticket_info,
-            "has_tickets": has_priced_tickets or (bool(found_keywords) and not truly_sold_out),
-        }
+            result["prices"] = price_lines[:10]
+            if price_lines and not is_empty:
+                result["status"] = "available"
+                result["detail"] = "Ticket listings with prices are showing."
+            elif is_empty:
+                result["status"] = "none"
+                result["detail"] = "Ticket list shows no results."
+            else:
+                result["status"] = "unclear"
+                result["detail"] = (
+                    "Could not read the ticket list (layout change or bot challenge)."
+                )
+            return result
+        finally:
+            await browser.close()
 
 
 def send_email(event, result):
     if not RESEND_API_KEY:
-        log("ERROR: RESEND_API_KEY env var not set — cannot send email.")
-        return
-
+        log("ERROR: RESEND_API_KEY not set — cannot send email.")
+        return False
     if not TO_EMAIL:
-        log("ERROR: TICKETMASTER_ALERT_EMAIL env var not set — cannot send email.")
-        return
+        log("ERROR: TICKETMASTER_ALERT_EMAIL not set — cannot send email.")
+        return False
 
     resend.api_key = RESEND_API_KEY
-
-    ticket_type = "resale tickets" if result["has_resale"] else "tickets"
-    body = f"Possible {ticket_type} detected for {event['name']}.\n\n"
+    body = f"Tickets appear to be available for {event['name']}.\n\n"
     body += f"Event page: {event['url']}\n\n"
-    if result["ticket_info"]:
-        body += "Detected info:\n" + "\n".join(f"  - {t}" for t in result["ticket_info"])
-    body += "\n\nCheck the link above to confirm and buy."
+    if result["prices"]:
+        body += "Listings detected:\n" + "\n".join(f"  - {t}" for t in result["prices"])
+        body += "\n\n"
+    body += "Check the link above to confirm and buy."
 
     try:
         resend.Emails.send({
-            "from": "Ticket Monitor <onboarding@resend.dev>",
+            "from": FROM_EMAIL,
             "to": TO_EMAIL,
             "subject": f"Ticketmaster Alert: {event['name']} tickets may be available!",
             "text": body,
         })
-        log(f"Alert email sent for {event['name']}.")
+        log(f"  Alert email sent for {event['name']}.")
+        return True
     except Exception as e:
-        log(f"Failed to send email: {e}")
+        log(f"  Failed to send email: {e}")
+        return False
 
 
 async def main():
+    if not EVENTS:
+        log("No events configured — nothing to check.")
+        return
+
+    state = load_state()
+    now = datetime.now(timezone.utc).isoformat()
+
     for event in EVENTS:
-        log(f"Checking {event['name']}...")
+        name = event["name"]
+        log(f"Checking {name}...")
         try:
             result = await check_tickets(event["url"])
-            if result["sold_out"]:
-                log(f"  Sold out — no tickets.")
-            elif result["has_tickets"]:
-                ticket_type = "resale tickets" if result["has_resale"] else "tickets"
-                log(f"  Possible {ticket_type} available! Keywords: {result['found_keywords']}")
+        except Exception as e:
+            log(f"  Error checking {name}: {type(e).__name__}: {e}")
+            continue
+
+        status = result["status"]
+        prev = state.get(name, {}).get("status")
+        log(f"  status={status} ({result['detail']})")
+        if result["prices"]:
+            log(f"  listings: {result['prices']}")
+
+        if status == "dead":
+            if prev != "dead":
+                log(f"  NOTE: {name} no longer resolves — remove it from EVENTS.")
+        elif status == "available":
+            # Edge-triggered: only alert on transition into availability.
+            if prev != "available":
                 send_email(event, result)
             else:
-                log(f"  No clear ticket availability. Keywords: {result['found_keywords']}")
-        except Exception as e:
-            log(f"  Error checking {event['name']}: {e}")
+                log("  Already alerted for this availability window — no email.")
+        elif status == "unclear":
+            log("  WARN: detection inconclusive; not alerting.")
+
+        state[name] = {"status": status, "checked_at": now, "detail": result["detail"]}
+
+    save_state(state)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
